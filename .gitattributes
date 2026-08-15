@@ -1,0 +1,6 @@
+# The repo is LF. Windows checkouts kept rewriting files to CRLF, which
+# turned every untouched file into a full-file diff.
+* text=auto eol=lf
+*.png binary
+*.gif binary
+*.tsm text eol=lf

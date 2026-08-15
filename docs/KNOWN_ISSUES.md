@@ -284,3 +284,163 @@ combine(operation="join", ...)
 
 ---
 *Document current as of MCP v8.2*
+
+---
+
+## 13. Background Thread + UI Commands = Crash
+
+### Problem
+`monitor_commands()` runs on a background thread. Most geometry API calls
+tolerate that, but anything driving Fusion's command pipeline
+(`executeTextCommand`, command definitions) must run on the **main thread** or
+Fusion misbehaves or dies.
+
+### Solution
+Bounce those calls through a custom event, which Fusion always delivers on the
+main thread. `run_on_main_thread(func)` does this - registered in `run()`,
+torn down in `stop()`.
+
+`execute_script` defaults to `main_thread=True` for the same reason.
+
+---
+
+## 14. Prismatic Mesh Conversion Is a Paid Feature
+
+### Problem
+`mesh_to_brep(method="prismatic")` silently returns a **faceted** result: one
+BRep face per mesh triangle. No error.
+
+### Cause
+Prismatic conversion requires a commercial subscription. A Personal-Use
+licence does not include it, so the method setting is ignored and the
+conversion falls back to faceted.
+
+### Detection
+`mesh_to_brep` now compares face count against triangle count and returns a
+`warning` when they match - that is a faceted result wearing a prismatic
+label. Do not trust `success: true` alone.
+
+### Workaround (free)
+Merge coplanar facets outside Fusion: sew triangles into a solid with
+OpenCascade and run `ShapeUpgrade_UnifySameDomain`. On a real part this took
+9,212 faces down to 2,541. It will not rebuild cylinders from tessellated
+strips - that part is what Autodesk charges for.
+
+---
+
+## 15. STEP and IGES Import Need the Cloud
+
+### Problem
+Importing STEP or IGES does **nothing at all**. No error, no dialog, no body.
+`importToNewDocument` even reports success and hands back an empty document.
+
+### Cause
+Fusion translates these formats server-side. Only a short list is handled
+locally: **F3D/F3Z, EAGLE, DXF, SVG, STL, OBJ**. STEP and IGES are not on it.
+Offline or signed out, the import silently produces nothing.
+
+### Diagnosis
+Try a trivial file. A 16 KB, 6-face cube that also fails to import proves the
+problem is connectivity, not file complexity. That test cut short two rounds
+of pointless file-size optimisation.
+
+### Note
+Mesh import (STL/OBJ) is local and keeps working offline. STL in, STEP out.
+
+---
+
+## 16. Part Design Documents Allow Only One Component
+
+### Problem
+`body_to_component` fails with: *"Part design documents can only contain one
+component. Add this part to an assembly to add multiple components."*
+
+### Cause
+Document type, not code. Check `Document Settings` in the browser.
+
+### Solution
+Document Settings -> pencil icon -> **Hybrid** or **Assembly** -> Convert.
+
+Mesh import also misbehaves in assembly documents
+(`InternalValidationError: bRet`), so pick the document type before importing
+geometry rather than after.
+
+---
+
+## 17. create_component Does Not Move Bodies
+
+### Problem
+The name says otherwise, but `create_component` only calls
+`occurrences.addNewComponent()` - you get an **empty** component and the body
+stays in the root.
+
+### Solution
+Use `body_to_component`, which calls `body.moveToComponent(occ)`.
+
+Body indices shift as bodies leave the root, so convert from the highest index
+down, or call it repeatedly with no index and let it take the last one.
+
+---
+
+## 18. get_body_info Hangs on High-Face-Count Bodies
+
+### Problem
+It enumerates every edge and every face, evaluating length and area for each.
+On a 9,212-face body it never returned and **blocked the command queue** -
+subsequent commands were consumed with no response.
+
+### Workaround
+Do not call it on faceted conversion output. Use `measure` for bounding box
+and volume. If you need the face count, `execute_script` with
+`result = root.bRepBodies.item(0).faces.count` costs nothing.
+
+### TODO
+Add a summary mode that returns counts without per-entity geometry.
+
+---
+
+## 19. T-Splines Can Be Created - via TSM
+
+Autodesk says there is no API for authoring T-Splines. There is a way in:
+`TSplineBodies.addByTSMDescription()` / `addByTSMFile()`.
+
+Full grammar, verified conventions and a working generator: **`TSM_FORMAT.md`**.
+
+---
+
+## 20. Subdivision Shrink Is Not a Bug
+
+### Problem
+A T-Spline built to a 520 mm cage measures less than 520 mm.
+
+### Cause
+The limit surface sits inside the control cage. Expected behaviour, not error.
+For a closed ring of n control points the factor is `(2+cos(2*pi/n))/3`.
+
+### Solution
+Do not trust the formula for a whole model - it assumes a uniform closed ring,
+and real cages have corners where the surface passes much closer. Build,
+measure, scale by `target/measured`, measure again. Recalibrate whenever the
+cage topology changes.
+
+Details in `TSM_FORMAT.md` section 3.
+
+---
+
+## 21. Undocumented Behaviour We Depend On
+
+Two capabilities here rest on things Autodesk does not document and has not
+promised to keep:
+
+- `executeTextCommand('Commands.Start ParaMeshConvertCommand')` and
+  `ParaMeshReduceCommand` - the fallback path for mesh conversion and reduction
+- the **TSM format** itself, including version fields tied to internal releases
+
+Both work today. Either could break with any Fusion update, and it would break
+silently rather than loudly.
+
+Run `tools/smoke_test.py` after every Fusion update.
+
+---
+*Issues 1-12: MCP v8.2. Issues 13-21 added after the session that built the
+mesh and T-Spline tooling.*

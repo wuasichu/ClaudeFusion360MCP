@@ -37,17 +37,21 @@ COMM_DIR.mkdir(exist_ok=True)
 
 mcp = FastMCP("Fusion 360 v7.2 Enhanced")
 
-def send_fusion_command(tool_name: str, params: dict) -> dict:
-    """Send command to Fusion 360 via file system"""
+def send_fusion_command(tool_name: str, params: dict, timeout: int = 45) -> dict:
+    """Send command to Fusion 360 via file system.
+
+    timeout: seconds to wait for a response. Mesh operations need far more
+    than the 45s default - converting or reducing a dense mesh can take
+    minutes of Fusion compute.
+    """
     timestamp = int(time.time() * 1000)
     cmd_file = COMM_DIR / f"command_{timestamp}.json"
     resp_file = COMM_DIR / f"response_{timestamp}.json"
-    
+
     with open(cmd_file, 'w') as f:
         json.dump({"type": "tool", "name": tool_name, "params": params, "id": timestamp}, f)
-    
-    # 900 iterations at 50ms = 45s timeout
-    for _ in range(900):
+
+    for _ in range(int(timeout / 0.05)):
         time.sleep(0.05)  # 50ms polling
         if resp_file.exists():
             with open(resp_file, 'r') as f:
@@ -60,8 +64,8 @@ def send_fusion_command(tool_name: str, params: dict) -> dict:
             if not result.get("success"):
                 raise Exception(result.get("error", "Unknown error"))
             return result
-    
-    raise Exception("Timeout after 45s - is Fusion 360 running with FusionMCP add-in?")
+
+    raise Exception(f"Timeout after {timeout}s - is Fusion 360 running with FusionMCP add-in?")
 
 # =============================================================================
 # BATCH OPERATIONS
@@ -615,9 +619,231 @@ def export_3mf(filepath: str) -> dict:
 # =============================================================================
 
 @mcp.tool()
+def loft(sketch_indices: list, profile_index: int = 0, rail_sketch_indices: list = None) -> dict:
+    """
+    Loft through multiple sketch profiles to create a solid body.
+    sketch_indices: list of section sketch indices (e.g. [0,1,2,...,9])
+    rail_sketch_indices: optional list of sketch indices containing guide rail curves
+    profile_index: which profile per sketch if multiple exist (default 0)
+    """
+    params = {"sketch_indices": sketch_indices, "profile_index": profile_index}
+    if rail_sketch_indices:
+        params["rail_sketch_indices"] = rail_sketch_indices
+    return send_fusion_command("loft", params)
+
+@mcp.tool()
+def create_3d_sketch(name: str = None) -> dict:
+    """Create a 3D sketch (not tied to a plane) for drawing rail curves in 3D space."""
+    return send_fusion_command("create_3d_sketch", {"name": name} if name else {})
+
+@mcp.tool()
+def draw_3d_line(x1: float, y1: float, z1: float, x2: float, y2: float, z2: float) -> dict:
+    """Draw a line in 3D space in the current sketch. Coordinates in cm."""
+    return send_fusion_command("draw_3d_line", {"x1": x1, "y1": y1, "z1": z1, "x2": x2, "y2": y2, "z2": z2})
+
+@mcp.tool()
+def draw_3d_spline(points: list) -> dict:
+    """Draw a spline through 3D points in the current sketch. points = [[x,y,z], ...] in cm."""
+    return send_fusion_command("draw_3d_spline", {"points": points})
+
+@mcp.tool()
 def import_mesh(filepath: str, unit: str = "mm") -> dict:
     """Import STL, OBJ, or 3MF mesh file. Units: mm, cm, or in"""
     return send_fusion_command("import_mesh", {"filepath": filepath, "unit": unit})
+
+@mcp.tool()
+def import_step(filepath: str) -> dict:
+    """Import a STEP (.step/.stp) file as a solid body into the current design"""
+    return send_fusion_command("import_step", {"filepath": filepath})
+
+@mcp.tool()
+def body_to_component(body_index: int = None, name: str = None) -> dict:
+    """
+    Move a root body into its own new component so it can be positioned,
+    rotated and jointed independently of the others.
+
+    This is what you want for assemblies. create_component only makes an EMPTY
+    component - it does not move any body into it.
+
+    Args:
+        body_index: Which root body (default: the last one)
+        name: Name for the new component
+
+    Body indices shift as bodies leave the root, so when converting several
+    bodies work from the highest index down, or call this repeatedly with no
+    body_index and let it take the last one each time.
+    """
+    params = {}
+    if body_index is not None:
+        params["body_index"] = body_index
+    if name:
+        params["name"] = name
+    return send_fusion_command("body_to_component", params)
+
+# =============================================================================
+# ARBITRARY SCRIPTING
+# =============================================================================
+
+@mcp.tool()
+def execute_script(code: str, main_thread: bool = True, timeout: int = 300) -> dict:
+    """
+    Run arbitrary Fusion API Python inside the add-in. This reaches the ENTIRE
+    Fusion API - appearances, saving, construction planes, section analysis,
+    joints, anything - without needing a dedicated tool for each.
+
+    Reach for this when no specific tool covers what you need. Prefer the
+    dedicated tools when they exist: they validate inputs and return clean
+    errors.
+
+    Args:
+        code: Python source. Assign to `result` to return a value; print()
+              output is captured separately.
+        main_thread: Run on Fusion's main thread (default True). REQUIRED for
+              anything touching the UI or executeTextCommand - calling those
+              from the background thread makes Fusion misbehave or crash.
+        timeout: Seconds to wait (default 300).
+
+    Pre-bound: adsk, app, ui, design, root, math, json, time.
+
+    Example - paint a body:
+        code = '''
+        body = root.bRepBodies.item(0)
+        lib = app.materialLibraries.itemByName('Fusion Appearance Library')
+        body.appearance = lib.appearances.itemByName('Paint - Enamel Glossy (Black)')
+        result = body.appearance.name
+        '''
+
+    No sandbox: this executes exactly what it is given, in the user's live
+    Fusion session. Errors return a full traceback instead of crashing, but
+    a genuinely destructive script will do genuinely destructive things.
+    Do not call it with code whose effect you have not reasoned through.
+    """
+    return send_fusion_command(
+        "execute_script",
+        {"code": code, "main_thread": main_thread, "timeout": timeout},
+        timeout=timeout + 30)
+
+# =============================================================================
+# T-SPLINES
+# =============================================================================
+
+@mcp.tool()
+def create_tspline(tsm_text: str = None, filepath: str = None, name: str = None) -> dict:
+    """
+    Create a T-Spline (Form) body from TSM data - real organic, editable
+    Form-workspace geometry, not a faceted solid.
+
+    Fusion has no API to author T-Splines from scratch, but TSplineBodies can be
+    built from TSM (T-Spline Mesh) data. Generate the TSM externally and push it
+    in here. Requires a parametric design (timeline on).
+
+    Args:
+        tsm_text: TSM-formatted description string
+        filepath: path to a .tsm file (use instead of tsm_text)
+        name: name for the resulting body
+
+    Use export_tspline_tsm on a known-good body first to learn the format.
+    """
+    params = {}
+    if tsm_text:
+        params["tsm_text"] = tsm_text
+    if filepath:
+        params["filepath"] = filepath
+    if name:
+        params["name"] = name
+    return send_fusion_command("create_tspline", params, timeout=300)
+
+@mcp.tool()
+def list_tspline_bodies() -> dict:
+    """List all T-Spline (Form) bodies in the design with their parent form features."""
+    return send_fusion_command("list_tspline_bodies", {})
+
+@mcp.tool()
+def export_tspline_tsm(index: int = 0, filepath: str = None) -> dict:
+    """
+    Export a T-Spline body as TSM. Always returns the description text; also
+    writes a .tsm file when filepath is given.
+
+    This is the way to learn the TSM format: make a simple Form body, export it,
+    study the text, then generate your own with create_tspline.
+    """
+    params = {"index": index}
+    if filepath:
+        params["filepath"] = filepath
+    return send_fusion_command("export_tspline_tsm", params, timeout=300)
+
+# =============================================================================
+# MESH
+# =============================================================================
+
+@mcp.tool()
+def get_mesh_bodies() -> dict:
+    """
+    List all mesh bodies (imported STL/OBJ/3MF) in the design.
+
+    Mesh bodies are a separate collection from solid bodies - get_design_info
+    reports them under "mesh_bodies". Returns index, name, triangle count and
+    bounding box in mm for each.
+
+    Check triangle_count before converting: over ~10k triangles you need
+    parametric=False on mesh_to_brep, and over ~200k you should reduce_mesh first.
+    """
+    return send_fusion_command("get_mesh_bodies", {})
+
+@mcp.tool()
+def get_mesh_bounding_box(mesh_index: int = 0) -> dict:
+    """Get the bounding box, size (mm) and centre of a mesh body."""
+    return send_fusion_command("get_mesh_bounding_box", {"mesh_index": mesh_index})
+
+@mcp.tool()
+def reduce_mesh(mesh_index: int = 0, target_faces: int = 10000) -> dict:
+    """
+    Decimate a mesh body down to a target triangle count.
+
+    Run this before mesh_to_brep on dense scans - conversion time scales badly
+    with facet count. 5,000-10,000 triangles is plenty for a mechanical part.
+
+    Args:
+        mesh_index: Which mesh body (default 0)
+        target_faces: Desired triangle count (default 10000)
+
+    Returns triangles_before and triangles_after so you can verify it worked.
+    No-ops safely if the mesh is already below the target.
+    """
+    return send_fusion_command(
+        "reduce_mesh", {"mesh_index": mesh_index, "target_faces": target_faces},
+        timeout=600)
+
+@mcp.tool()
+def mesh_to_brep(mesh_index: int = 0, method: str = "prismatic",
+                 parametric: bool = False) -> dict:
+    """
+    Convert a mesh body (imported STL) into a real BRep solid body.
+
+    Args:
+        mesh_index: Which mesh body (default 0)
+        method:
+            "prismatic" (default) - merges coplanar facets into genuine planar
+                faces. Best for mechanical parts; the result can be filleted,
+                cut and dimensioned like normal CAD geometry.
+            "faceted" - one triangle becomes one face. Fast and geometrically
+                faithful, but the body is heavy and effectively uneditable.
+                Fine when you only need booleans or a STEP export.
+            "organic" - T-Spline surfaces, for free-form curved shapes.
+        parametric: False (default) creates a base feature with no facet limit.
+            True keeps a parametric feature in the timeline but is capped at
+            roughly 10,000 facets and will fail above that.
+
+    Prefer reduce_mesh first on anything dense. Conversion can take minutes;
+    this tool waits up to 10 minutes.
+
+    Returns the indices and names of the new solid bodies, which you can then
+    pass to get_body_info, fillet, combine or export_step.
+    """
+    return send_fusion_command(
+        "mesh_to_brep",
+        {"mesh_index": mesh_index, "method": method, "parametric": parametric},
+        timeout=600)
 
 # =============================================================================
 # MAIN
