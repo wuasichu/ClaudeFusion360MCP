@@ -76,6 +76,39 @@ def build_tsm(verts, quads, knot_interval=1):
     if missing:
         raise ValueError("vertices not used by any face: %r" % missing[:10])
 
+    # Topology can be perfectly valid while the geometry is degenerate, and
+    # Fusion rejects that with an opaque ASM_TSP_IG_SURFACE_MULTIPLE_ISSUES.
+    # Catch it here, where the message can actually say what is wrong.
+    def _dist2(a, b):
+        return sum((x - y) ** 2 for x, y in zip(verts[a], verts[b]))
+
+    tol2 = 1e-12
+    coincident = []
+    for f, quad in enumerate(quads):
+        for k in range(4):
+            a, b = quad[k], quad[(k + 1) % 4]
+            if _dist2(a, b) < tol2:
+                coincident.append((f, a, b))
+    if coincident:
+        f, a, b = coincident[0]
+        raise ValueError(
+            "%d quad edge(s) have coincident endpoints - zero-area faces. "
+            "First: face %d, vertices %d and %d both at %r. Fusion rejects "
+            "these as ASM_TSP_IG_SURFACE_MULTIPLE_ISSUES."
+            % (len(coincident), f, a, b, verts[a]))
+
+    dupes = {}
+    for i, p in enumerate(verts):
+        key = tuple(round(c, 9) for c in p)
+        dupes.setdefault(key, []).append(i)
+    stacked = {k: v for k, v in dupes.items() if len(v) > 1}
+    if stacked:
+        k, v = next(iter(stacked.items()))
+        raise ValueError(
+            "%d position(s) have more than one vertex on them - the cage is "
+            "pinched. First: %r shared by vertices %r"
+            % (len(stacked), k, v[:6]))
+
     out = [HEADER]
     for f in range(nf):
         out.append("f %d 0" % (4 * f))
